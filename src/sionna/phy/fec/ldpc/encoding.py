@@ -80,7 +80,7 @@ class LDPC5GEncoder(Block):
         if k<12:
             raise ValueError("Unsupported code length (k too small).")
 
-        if n>(316*384):
+        if n>(68*384) or (bg=="bg2" and n>(52*384)):
             raise ValueError("Unsupported code length (n too large).")
         if n<0:
             raise ValueError("Unsupported code length (n negative).")
