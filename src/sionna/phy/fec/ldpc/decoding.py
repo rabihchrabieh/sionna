@@ -1338,6 +1338,10 @@ class LDPC5GDecoder(LDPCBPDecoder):
         # VN-1 node will always "send" llr=0 to the connected CN. Thus, this
         # CN will only send 0 messages to all other VNs, i.e., does not
         # contribute to the decoding process.
+        # TODO: the above statement is not fully correct, as the CN may
+        # still contribute to the decoding process if it is connected to
+        # several other VNs. Nevertheless, in a test with k=64, n=128, the
+        # performance is nearly identical to the non-pruned case.
         if not isinstance(prune_pcm, bool):
             raise TypeError('prune_pcm must be bool.')
         self._prune_pcm = prune_pcm
