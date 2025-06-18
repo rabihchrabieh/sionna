@@ -113,6 +113,7 @@ class LDPC5GEncoder(Block):
         self._z, self._i_ls, self._k_b = self._sel_lifting(self._k, self._bg)
 
         if params_only:
+            # These parameters are described below
             bm_num_cols = 68 if bg == "bg1" else 52
             self._n_ldpc = bm_num_cols * self._z
             self._k_ldpc = self._k_b * self._z
