@@ -10,6 +10,7 @@ from importlib_resources import files, as_file
 from . import codes # pylint: disable=relative-beyond-top-level
 import numbers # to check if n, k are numbers
 from sionna.phy import Block
+from typing import Optional
 
 class LDPC5GEncoder(Block):
     # pylint: disable=line-too-long
@@ -664,7 +665,7 @@ class LDPC5GEncoder(Block):
         if input_shape[-1]!=self._k:
             raise ValueError("Last dimension must be of length k.")
 
-    def call(self, bits):
+    def call(self, bits, rv: Optional[str]=None):
         """5G LDPC encoding function including rate-matching.
 
         This function returns the encoded codewords as specified by the 3GPP NR Initiative [3GPPTS38212_LDPC]_ including puncturing and shortening.
@@ -673,11 +674,15 @@ class LDPC5GEncoder(Block):
 
         bits (tf.float): Tensor of shape `[...,k]` containing the
                 information bits to be encoded.
+        rv (str): Optional redundancy version to be set. One of 'rv0', 'rv1',
+                  'rv2', 'rv3'. If not supplied, the current RV is used.
 
         Returns:
 
         `tf.float`: Tensor of shape `[...,n]`.
         """
+        if rv is not None:
+            self.set_rv(rv)
 
         # Reshape inputs to [...,k]
         input_shape = bits.get_shape().as_list()
