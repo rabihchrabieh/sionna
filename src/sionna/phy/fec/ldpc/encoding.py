@@ -68,6 +68,7 @@ class LDPC5GEncoder(Block):
                  num_bits_per_symbol=None,
                  bg=None,
                  precision=None,
+                 params_only=False,
                  **kwargs):
 
         super().__init__(precision=precision, **kwargs)
@@ -110,6 +111,14 @@ class LDPC5GEncoder(Block):
         self._bg = self._sel_basegraph(self._k, self._coderate, bg)
 
         self._z, self._i_ls, self._k_b = self._sel_lifting(self._k, self._bg)
+
+        if params_only:
+            bm_num_cols = 68 if bg == "bg1" else 52
+            self._n_ldpc = bm_num_cols * self._z
+            self._k_ldpc = self._k_b * self._z
+            self._circ_buff_start = 2 * self._z
+            return
+
         self._bm = self._load_basegraph(self._i_ls, self._bg)
 
         # total number of codeword bits
@@ -212,6 +221,29 @@ class LDPC5GEncoder(Block):
     #################
     # Utility methods
     #################
+
+    @staticmethod
+    def get_params(k: int, n: int, bg: Optional[str]=None) -> "LDPC5GEncoder":
+        """Get the parameters of the LDPC encoder without loading the basegraph
+        and constructing the parity-check matrix.
+
+        Parameters
+        ----------
+        k: int
+            Number of information bits.
+        n: int
+            Number of codeword bits.
+        bg: `None` (default) | "bg1" | "bg2"
+            Basegraph to be used for the code construction.
+            If `None` is provided, the encoder will automatically select
+            the basegraph according to [3GPPTS38212_LDPC]_.
+
+        Returns
+        -------
+        LDPC5GEncoder instance with the specified parameters but without
+        loading the basegraph or constructing the parity-check matrix.
+        """
+        return LDPC5GEncoder(k=k, n=n, bg=bg, params_only=True)
 
     def set_rv(self, rv: str) -> int:
         """Set the RV (redundancy version) for the LDPC code.
