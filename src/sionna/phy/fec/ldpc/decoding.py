@@ -1224,6 +1224,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
         removed from the decoding graph (see [Cammerer]_ for details). Besides
         numerical differences, this should yield the same decoding result but
         improved the decoding throughput and reduces the memory footprint.
+        In HARQ mode, this is disabled by default (to be optimized in next
+        version).
 
     num_iter: `int` (default: 20)
         Defining the number of decoder iterations (due to batching, no early
@@ -1257,6 +1259,15 @@ class LDPC5GDecoder(LDPCBPDecoder):
     precision : `None` (default) | "single" | "double"
         Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
+        
+    harq_mode: `bool`, (default `False`)
+        If `True`, the decoder is used in HARQ mode (incremental
+        redundancy) where a circular buffer of successive LLR
+        receptions are weighted and accumulated. The circular buffer
+        is of size [batch_size, n_cp]. However, batch_size may decrease
+        after each transmission: as some code blocks succeed, they should be
+        removed from the buffer (by calling method del_from_circ_buffer). The
+        decoder will then only process remaining code blocks.
 
     Input
     -----
@@ -1313,6 +1324,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
                  prune_pcm=True,
                  return_state=False,
                  precision=None,
+                 harq_mode=False,
                  **kwargs):
 
         # needs the 5G Encoder to access all 5G parameters
@@ -1321,6 +1333,11 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
         self._encoder = encoder
         pcm = encoder.pcm
+
+        self.harq_mode = harq_mode
+        # Default RV0
+        self._circ_buff_start = 2 * self.encoder.z
+        self.circ_buff = None
 
         if not isinstance(return_infobits, bool):
             raise TypeError('return_info must be bool.')
@@ -1344,7 +1361,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         # performance is nearly identical to the non-pruned case.
         if not isinstance(prune_pcm, bool):
             raise TypeError('prune_pcm must be bool.')
-        self._prune_pcm = prune_pcm
+        self._prune_pcm = prune_pcm if not self.harq_mode else False
         if prune_pcm:
             # find index of first position with only degree-1 VN
             dv = np.sum(pcm, axis=0) # VN degree
@@ -1444,29 +1461,43 @@ class LDPC5GDecoder(LDPCBPDecoder):
                                         self._encoder.out_int_inv,
                                         axis=-1)
 
-        # undo puncturing of the first 2*Z bit positions
-        llr_5g = tf.concat(
-                    [tf.zeros([batch_size, 2*self.encoder.z], self.rdtype),
-                    llr_ch_reshaped], axis=1)
+        # undo puncturing and place the LLRs at the right position
+        n = tf.shape(llr_ch_reshaped)[1]
 
-        # undo puncturing of the last positions
-        # total length must be n_ldpc, while llr_ch has length n
-        # first 2*z positions are already added
-        # -> add n_ldpc - n - 2Z punctured positions
-        k_filler = self.encoder.k_ldpc - self.encoder.k # number of filler bits
-        nb_punc_bits = ((self.encoder.n_ldpc - k_filler)
-                        - self.encoder.n - 2*self.encoder.z)
+        # pad to length n_cb = n_ldpc - k_filler
+        pad_len = tf.maximum(0, self.encoder.n_cb - n)
+        llr_5g_unrotated = tf.pad(llr_ch_reshaped,
+                                  [[0, 0], [0, pad_len]])  # shape: [batch, n_cb]
 
-        llr_5g = tf.concat([llr_5g,
-                    tf.zeros([batch_size, nb_punc_bits - self._nb_pruned_nodes],
-                            self.rdtype)], axis=1)
+        # roll (circular shift)
+        llr_5g = tf.roll(llr_5g_unrotated,
+                         shift=self._circ_buff_start, axis=1)
+    
+        if self.harq_mode:
+            if self.circ_buff is None:
+                # first HARQ round — initialize circular buffer
+                # tf.Variable is required to persist and mutate state in graph mode
+                self.circ_buff = tf.Variable(tf.identity(llr_5g), trainable=False)
+            else:
+                # check batch size matches — works in both eager and graph mode
+                tf.debugging.assert_equal(
+                    tf.shape(self.circ_buff)[0],
+                    tf.shape(llr_5g)[0],
+                    message="Batch size of new LLRs does not match the batch size of the circular buffer."
+                )
+                # accumulate weighted LLRs into the circular buffer
+                self.circ_buff.assign(w_old * self.circ_buff + w_new * llr_5g)
+
+                # update the working LLRs to the accumulated values
+                llr_5g = tf.identity(self.circ_buff)
 
         # undo shortening (= add 0 positions after k bits, i.e. LLR=LLR_max)
-        # the first k positions are the systematic bits
+        # the first k positions are the systematic bits; also prune nodes,
+        # if any
         x1 = tf.slice(llr_5g, [0,0], [batch_size, self.encoder.k])
 
         # parity part
-        nb_par_bits = (self.encoder.n_ldpc - k_filler
+        nb_par_bits = (self.encoder.n_cb
                        - self.encoder.k - self._nb_pruned_nodes)
         x2 = tf.slice(llr_5g,
                       [0, self.encoder.k],
@@ -1474,7 +1505,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
         # negative sign due to logit definition
         z = -tf.cast(self._llr_max, self.rdtype) \
-            * tf.ones([batch_size, k_filler], self.rdtype)
+            * tf.ones([batch_size, self.encoder.k_filler], self.rdtype)
 
         llr_5g = tf.concat([x1, z, x2], axis=1)
 
