@@ -246,13 +246,21 @@ class LDPC5GEncoder(Block):
         """
         return LDPC5GEncoder(k=k, n=n, bg=bg, params_only=True)
 
-    def set_rv(self, rv: str) -> int:
-        """Set the RV (redundancy version) for the LDPC code.
+    @staticmethod
+    def convert_rv(rv: str, n_cb: int, z: int) -> int:
+        """Convert the RV to start of circular buffer (redundancy
+        version).
 
         Parameters
         ----------
         rv: str, one of 'rv0', 'rv1', 'rv2', 'rv3'.
             Redundancy version to be set.
+            
+        n_cb: int
+            Length of the HARQ circular buffer.
+            
+        z: int
+            Lifting factor of the basegraph.
             
         Output
         -------
@@ -263,14 +271,20 @@ class LDPC5GEncoder(Block):
         if rv not in ['rv0', 'rv1', 'rv2', 'rv3']:
             raise TypeError("rv must be one of 'rv0', 'rv1', 'rv2', 'rv3'.")
         if rv == 'rv0':
-            self._circ_buff_start = 2 * self._z
+            circ_buff_start = 2 * z
         elif rv == 'rv1':
-            self._circ_buff_start = self.n_cb // 4
+            circ_buff_start = n_cb // 4
         elif rv == 'rv2':
-            self._circ_buff_start = self.n_cb // 2
+            circ_buff_start = n_cb // 2
         else:  # rv == 'rv3'
-            self._circ_buff_start = 3 * self.n_cb // 4
+            circ_buff_start = 3 * n_cb // 4
 
+        return circ_buff_start
+
+    def set_rv(self, rv: str) -> int:
+        """Set the RV (redundancy version)."""
+        self._circ_buff_start = LDPC5GEncoder.calc_rv(
+            rv, self.n_cb, self.z)
         return self._circ_buff_start
 
     def set_circ_buff_start(self, start: int):
