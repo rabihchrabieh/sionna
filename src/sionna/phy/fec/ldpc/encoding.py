@@ -776,7 +776,8 @@ class LDPC5GEncoder(Block):
         start = self._circ_buff_start
         buffer_end = c_no_filler.shape[1]
         c_short = tf.cond(
-            start + self.n <= buffer_end,
+            tf.convert_to_tensor(start) + self.n <=
+                tf.convert_to_tensor(buffer_end),
             lambda: c_no_filler[:, start : start + self.n],
             lambda: tf.concat([
                 c_no_filler[:, start:],
