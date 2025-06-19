@@ -1365,6 +1365,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
         self._harq_mode = harq_mode
         # Default RV0
         self._circ_buff_start = 2 * self.encoder.z
+        if self._harq_mode:
+            # Not yet implemented for HARQ mode
+            prune_pcm = False
 
         if not isinstance(return_infobits, bool):
             raise TypeError('return_info must be bool.')
@@ -1388,7 +1391,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         # performance is nearly identical to the non-pruned case.
         if not isinstance(prune_pcm, bool):
             raise TypeError('prune_pcm must be bool.')
-        self._prune_pcm = prune_pcm if not self._harq_mode else False
+        self._prune_pcm = prune_pcm
         if prune_pcm:
             # find index of first position with only degree-1 VN
             dv = np.sum(pcm, axis=0) # VN degree
@@ -1495,15 +1498,18 @@ class LDPC5GDecoder(LDPCBPDecoder):
         self._old_shape_5g = input_shape
 
     def call(self, llr_ch, /, *, num_iter=None, msg_v2c=None,
-             circ_buff: Optional[tf.Tensor] = None,
+             circ_buff: tf.Tensor = tf.zeros([0, 1], dtype=tf.float32),
              harq_weight_old: Union[float, tf.Tensor] = 1.0,
              harq_weight_new: Union[float, tf.Tensor] = 1.0):
         """Iterative BP decoding function and rate matching.
         """
 
         llr_ch_shape = llr_ch.get_shape().as_list()
-        new_shape = [-1, self.encoder.n]
-        llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
+        if not self._harq_mode:
+            new_shape = [-1, self.encoder.n]
+            llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
+        else:
+            llr_ch_reshaped = llr_ch
         batch_size = tf.shape(llr_ch_reshaped)[0]
 
         # invert if rate-matching output interleaver was applied as defined in
@@ -1529,7 +1535,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         if self._harq_mode:
             def init_circ_buffer():
                 # first HARQ round — initialize circular buffer
-                new_buff = tf.Variable(tf.identity(llr_5g), trainable=False)
+                new_buff = tf.identity(llr_5g)
                 return llr_5g, new_buff  # return llr_5g as-is
 
             def accumulate_llrs():
@@ -1551,7 +1557,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
             # choose init or accumulate based on whether the buffer is
             # already initialized
             llr_5g, circ_buff = tf.cond(
-                circ_buff is None,
+                tf.equal(tf.shape(circ_buff)[0], 0),
                 true_fn=init_circ_buffer,
                 false_fn=accumulate_llrs
             )

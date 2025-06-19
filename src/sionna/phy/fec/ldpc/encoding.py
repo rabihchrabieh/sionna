@@ -281,6 +281,24 @@ class LDPC5GEncoder(Block):
 
         return circ_buff_start
 
+    def set_n(self, n: int):
+        """Set the desired codeword length. It can be used to change the
+        codeword length for various retransmissions.
+
+        Parameters
+        ----------
+        n: int
+            Desired codeword length.
+        """
+        if not isinstance(n, numbers.Number):
+            raise TypeError("n must be a number.")
+        n = int(n)
+        if n <= 0:
+            raise ValueError("n must be a positive integer.")
+        if n > self.n_cb:
+            raise ValueError("n must be smaller than n_cb.")
+        self._n = n
+
     def set_rv(self, rv: str) -> int:
         """Set the RV (redundancy version)."""
         self._circ_buff_start = LDPC5GEncoder.convert_rv(
