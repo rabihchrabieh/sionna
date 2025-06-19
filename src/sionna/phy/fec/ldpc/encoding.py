@@ -283,7 +283,7 @@ class LDPC5GEncoder(Block):
 
     def set_rv(self, rv: str) -> int:
         """Set the RV (redundancy version)."""
-        self._circ_buff_start = LDPC5GEncoder.calc_rv(
+        self._circ_buff_start = LDPC5GEncoder.convert_rv(
             rv, self.n_cb, self.z)
         return self._circ_buff_start
 

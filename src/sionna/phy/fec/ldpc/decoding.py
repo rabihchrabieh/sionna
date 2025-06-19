@@ -6,9 +6,11 @@
 import tensorflow as tf
 import numpy as np
 import scipy as sp # for sparse H matrix computations
+import numbers # to check for numbers
 from sionna.phy import Block
 from sionna.phy.fec.ldpc.encoding import LDPC5GEncoder
 import types
+from typing import Union, Optional
 
 class LDPCBPDecoder(Block):
     # pylint: disable=line-too-long
@@ -1224,8 +1226,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
         removed from the decoding graph (see [Cammerer]_ for details). Besides
         numerical differences, this should yield the same decoding result but
         improved the decoding throughput and reduces the memory footprint.
-        In HARQ mode, this is disabled by default (to be optimized in next
-        version).
+        In HARQ mode, this is currently disabled by default (to be optimized
+        in next version).
 
     num_iter: `int` (default: 20)
         Defining the number of decoder iterations (due to batching, no early
@@ -1265,20 +1267,43 @@ class LDPC5GDecoder(LDPCBPDecoder):
         redundancy) where a circular buffer of successive LLR
         receptions are weighted and accumulated. The circular buffer
         is of size [batch_size, n_cp]. However, batch_size may decrease
-        after each transmission: as some code blocks succeed, they should be
-        removed from the buffer (by calling method del_from_circ_buffer). The
+        after each transmission: as some code blocks succeed, they could be
+        trimmed from the batch (from the input and from the circular buffer);
         decoder will then only process remaining code blocks.
-
+        In graph mode with fixed batches, one option is to send first
+        transmissions, record failed code blocks, and later send rebatched
+        second transmissions only for the failed code blocks.
+        Subsequent transmissions may use a different rv, modulation order
+        and/or codeword length than first transmission. The interleaving
+        implementation needs to be adapted.
+        The HARQ circular buffer is managed externally by the caller (this
+        simplifies graph mode and allows for reusing the instance with
+        different batches and retransmissions).
+        
     Input
     -----
     llr_ch: [...,n], tf.float
         Tensor containing the channel logits/llr values.
+        
+    num_iter: `Non` | `int`, (default: None)
+        Number of decoding iterations to be performed. When None is given,
+        the decoder uses the value set in the constructor (self._num_iter).
 
     msg_v2c: `None` | [num_edges, batch_size], tf.float
         Tensor of VN messages representing the internal decoder state.
         Required only if the decoder shall use its previous internal state, e.g.
         for iterative detection and decoding (IDD) schemes.
-
+        
+    harq_circ_buff: `None` | [batch_size, n_cb], tf.float
+        In HARQ mode, tensor containing the HARQ circular buffer, and
+        None if none is available yet (first transmission).
+        
+    harq_weight_old: float | [batch_size, 1], tf.float (default: 1.0)
+        Weight of the HARQ circular buffer.
+        
+    harq_weight_new: float | [batch_size, 1], tf.float (default: 1.0)
+        Weight of the new LLRs.
+    
     Output
     ------
     : [...,n] or [...,k], tf.float
@@ -1292,6 +1317,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
         Returned only if ``return_state`` is set to `True`.
         Remark: always retruns entire decoder state, even if
         ``return_infobits`` is True.
+
+    : [batch_size,n_cb], tf.float
+        Tensor of updated HARQ circular buffer.
 
     Note
     ----
@@ -1334,10 +1362,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
         self._encoder = encoder
         pcm = encoder.pcm
 
-        self.harq_mode = harq_mode
+        self._harq_mode = harq_mode
         # Default RV0
         self._circ_buff_start = 2 * self.encoder.z
-        self.circ_buff = None
 
         if not isinstance(return_infobits, bool):
             raise TypeError('return_info must be bool.')
@@ -1361,7 +1388,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         # performance is nearly identical to the non-pruned case.
         if not isinstance(prune_pcm, bool):
             raise TypeError('prune_pcm must be bool.')
-        self._prune_pcm = prune_pcm if not self.harq_mode else False
+        self._prune_pcm = prune_pcm if not self._harq_mode else False
         if prune_pcm:
             # find index of first position with only degree-1 VN
             dv = np.sum(pcm, axis=0) # VN degree
@@ -1436,6 +1463,28 @@ class LDPC5GDecoder(LDPCBPDecoder):
     # Sionna block functions
     ########################
 
+    def set_rv(self, rv: str) -> int:
+        """Set the RV (redundancy version)."""
+        self._circ_buff_start = LDPC5GEncoder.convert_rv(
+            rv, self.encoder.n_cb, self.encoder.z)
+        return self._circ_buff_start
+
+    def set_circ_buff_start(self, start: int):
+        """Set the circular buffer start position for rate-matching,
+        outside the usual RV setting.
+
+        Parameters
+        ----------
+        start: int
+            Start position of the circular buffer. The value must be in the
+            range [0, n_cb-1] as specified in 38.212.
+        """
+        if not isinstance(start, numbers.Number):
+            raise TypeError("start must be a number.")
+        if start < 0 or start >= self.encoder.n_cb:
+            raise ValueError("start must be in the range [0, n_cb-1].")
+        self._circ_buff_start = start
+
     def build(self, input_shape, **kwargs):
         """Build block"""
 
@@ -1445,7 +1494,10 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
         self._old_shape_5g = input_shape
 
-    def call(self, llr_ch, /, *, num_iter=None, msg_v2c=None):
+    def call(self, llr_ch, /, *, num_iter=None, msg_v2c=None,
+             circ_buff: Optional[tf.Tensor] = None,
+             harq_weight_old: Union[float, tf.Tensor] = 1.0,
+             harq_weight_new: Union[float, tf.Tensor] = 1.0):
         """Iterative BP decoding function and rate matching.
         """
 
@@ -1455,7 +1507,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
         batch_size = tf.shape(llr_ch_reshaped)[0]
 
         # invert if rate-matching output interleaver was applied as defined in
-        # Sec. 5.4.2.2 in 38.212
+        # Sec. 5.4.2.2 in 38.212 (currently incompatible with graph mode when
+        # num_bits_per_symbol or block size changes at runtime)
         if self._encoder.num_bits_per_symbol is not None:
             llr_ch_reshaped = tf.gather(llr_ch_reshaped,
                                         self._encoder.out_int_inv,
@@ -1472,25 +1525,37 @@ class LDPC5GDecoder(LDPCBPDecoder):
         # roll (circular shift)
         llr_5g = tf.roll(llr_5g_unrotated,
                          shift=self._circ_buff_start, axis=1)
-    
-        if self.harq_mode:
-            if self.circ_buff is None:
+
+        if self._harq_mode:
+            def init_circ_buffer():
                 # first HARQ round — initialize circular buffer
-                # tf.Variable is required to persist and mutate state in graph mode
-                self.circ_buff = tf.Variable(tf.identity(llr_5g), trainable=False)
-            else:
+                new_buff = tf.Variable(tf.identity(llr_5g), trainable=False)
+                return llr_5g, new_buff  # return llr_5g as-is
+
+            def accumulate_llrs():
                 # check batch size matches — works in both eager and graph mode
                 tf.debugging.assert_equal(
-                    tf.shape(self.circ_buff)[0],
-                    tf.shape(llr_5g)[0],
+                    tf.shape(circ_buff)[0], batch_size,
                     message="Batch size of new LLRs does not match the batch size of the circular buffer."
                 )
+                harq_weight_old_tensor = tf.convert_to_tensor(harq_weight_old, dtype=llr_5g.dtype)
+                harq_weight_new_tensor = tf.convert_to_tensor(harq_weight_new, dtype=llr_5g.dtype)
+
                 # accumulate weighted LLRs into the circular buffer
-                self.circ_buff.assign(w_old * self.circ_buff + w_new * llr_5g)
+                new_buff = harq_weight_old_tensor * circ_buff + \
+                    harq_weight_new_tensor * llr_5g
 
                 # update the working LLRs to the accumulated values
-                llr_5g = tf.identity(self.circ_buff)
+                return tf.identity(new_buff), new_buff
 
+            # choose init or accumulate based on whether the buffer is
+            # already initialized
+            llr_5g, circ_buff = tf.cond(
+                circ_buff is None,
+                true_fn=init_circ_buffer,
+                false_fn=accumulate_llrs
+            )
+            
         # undo shortening (= add 0 positions after k bits, i.e. LLR=LLR_max)
         # the first k positions are the systematic bits; also prune nodes,
         # if any
@@ -1528,7 +1593,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
             output_shape[0] = -1
             u_reshaped = tf.reshape(u_hat, output_shape)
 
-            if self._return_state:
+            if self._harq_mode:
+                return u_reshaped, circ_buff, msg_v2c
+            elif self._return_state:
                 return u_reshaped, msg_v2c
             else:
                 return u_reshaped
@@ -1565,7 +1632,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
             llr_ch_shape[0] = -1
             x_short= tf.reshape(x_short, llr_ch_shape)
 
-            if self._return_state:
+            if self._harq_mode:
+                return x_short, circ_buff, msg_v2c
+            elif self._return_state:
                 return x_short, msg_v2c
             else:
                 return x_short
