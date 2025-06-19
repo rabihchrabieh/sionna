@@ -1296,7 +1296,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         
     harq_circ_buff: `None` | [batch_size, n_cb], tf.float
         In HARQ mode, tensor containing the HARQ circular buffer, and
-        None if none is available yet (first transmission).
+        Use None for first transmission.
         
     harq_weight_old: float | [batch_size, 1], tf.float (default: 1.0)
         Weight of the HARQ circular buffer.
