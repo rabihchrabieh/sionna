@@ -112,6 +112,7 @@ class System_Model(Block):
                  num_bits_per_symbol,                 
                  encoder,
                  decoder,
+                 rv_set=['rv0'],
                  demapping_method="app",
                  sim_esno=False,
                  cw_estimates=False):
@@ -143,10 +144,7 @@ class System_Model(Block):
         # FEC encoder / decoder
         self.encoder = encoder
         self.decoder = decoder
-        
-        z = self.encoder.z
-        self.encoder.set_circ_buff_start(2*z)
-        self.decoder.set_circ_buff_start(2*z)
+        self.rv_set = rv_set
         
         
     @tf.function() # enable graph mode for increased throughputs
@@ -162,43 +160,31 @@ class System_Model(Block):
                            num_bits_per_symbol=self.num_bits_per_symbol,
                            coderate=self.k/self.n)            
 
-        # Reset to RV0 (from a previous loop)
-        self.encoder.set_rv('rv0')
-        self.decoder.set_rv('rv0')
-        
         u = self.source([batch_size, self.k]) # generate random data
-        c = self.encoder(u) # explicitly encode
+        circ_buff = LDPC5GDecoder.get_initial_circ_buff()
         
-        x = self.mapper(c) # map c to symbols x
-
-        y = self.channel(x, no) # transmit over AWGN channel
-
-        llr_ch = self.demapper(y, no) # demap y to LLRs
-
-        u_hat = self.decoder(llr_ch) # run FEC decoder (incl. rate-recovery)
-
-        if self.decoder._harq_mode:
-            if True:
-                # Second HARQ round
-                circ_buff = u_hat[1]
-                self.encoder.set_rv('rv2')
-                self.decoder.set_rv('rv2')
-                c2 = self.encoder(u) # explicitly encode
-                x2 = self.mapper(c2) # map c to symbols x
-                y2 = self.channel(x2, no) # transmit over AWGN channel
-                llr_ch2 = self.demapper(y2, no) # demap y to LLRs
-                u_hat = self.decoder(llr_ch2, circ_buff=circ_buff) # run FEC decoder
-            u_hat = u_hat[0]
+        for rv in self.rv_set:
+            # Reset to RV0 (from a previous loop)
+            self.encoder.set_rv(rv)
+            self.decoder.set_rv(rv)
             
-        if self.cw_estimates:
-            return c, u_hat
+            c = self.encoder(u) # explicitly encode    
+            x = self.mapper(c) # map c to symbols x
+            y = self.channel(x, no) # transmit over AWGN channel
+            llr_ch = self.demapper(y, no) # demap y to LLRs
+
+            u_hat = self.decoder(llr_ch, circ_buff=circ_buff) # run FEC decoder (incl. rate-recovery)
+            circ_buff = u_hat[1]
             
+        u_hat = u_hat[0]
+
         return u, u_hat
 
 # %%
 # code parameters
 k = 64 # number of information bits per codeword
 n = 128 # desired codeword length
+rv_set = ['rv0', 'rv2', 'rv3', 'rv1']  # redundancy version set for HARQ
 
 # Create list of encoder/decoder pairs to be analyzed.
 # This allows automated evaluation of the whole list later.
@@ -206,30 +192,33 @@ codes_under_test = []
 
 # 5G LDPC codes with 20 BP iterations
 enc = LDPC5GEncoder(k=k, n=n)
-dec = LDPC5GDecoder(enc, num_iter=20, prune_pcm=True, harq_mode=True)
-name = "5G LDPC BP-20"
+dec = LDPC5GDecoder(enc, num_iter=20, prune_pcm=False, harq_mode=True)
 
-ber_plot128 = PlotBER(f"Performance of Short Length Codes (k={k}, n={n})")
+ber_plot128 = PlotBER(f"5G LDPC BP-20 - HARQ Performance (k={k}, n={n})")
 
 # %% [markdown]
 # And run the BER simulation for each code.
 
 # %%
 num_bits_per_symbol = 2 # QPSK
-ebno_db = np.arange(0, 5, 0.5) # sim SNR range 
+ebno_db = np.arange(0, 4, 0.5) # sim SNR range 
+ebno_offset = np.array([0.0, -4.0, -6.0, -7.0]) # offset for each number of retries
 
-# run ber simulations for each code we have added to the list
-# generate a new model with the given encoder/decoder
-model = System_Model(k=k,
+for i in range(len(rv_set)):
+    # run BLER simulations for each number of retries:
+    # rv0; rv0+rv2; rv0+rv2+rv3; rv0+rv2+rv3+rv1.
+    # In each case, the first i+1 redundancy versions are used.
+    model = System_Model(k=k,
                         n=n,
                         num_bits_per_symbol=num_bits_per_symbol,
                         encoder=enc,
-                        decoder=dec)
+                        decoder=dec,
+                        rv_set=rv_set[0:i+1])  # use the first i+1 redundancy versions
 
-# the first argument must be a callable (function) that yields u and u_hat for batch_size and ebno
-ber_plot128.simulate(model, # the function have defined previously
-                        ebno_dbs=ebno_db, # SNR to simulate
-                        legend=name, # legend string for plotting
+    # the first argument must be a callable (function) that yields u and u_hat for batch_size and ebno
+    ber_plot128.simulate(model, # the function have defined previously
+                        ebno_dbs=ebno_db + ebno_offset[i], # SNR to simulate
+                        legend=" + ".join(rv_set[0:i+1]), # legend string for plotting
                         max_mc_iter=100, # run 100 Monte Carlo runs per SNR point
                         num_target_block_errors=100, # continue with next SNR point after 1000 bit errors
                         batch_size=10000, # batch-size per Monte Carlo run
@@ -240,4 +229,5 @@ ber_plot128.simulate(model, # the function have defined previously
                         forward_keyboard_interrupt=True); # should be True in a loop
 
 # and show the figure
-ber_plot128(ylim=(1e-5, 1), show_bler=False) # we set the ylim to 1e-5 as otherwise more extensive simulations would be required for accurate curves.
+ber_plot128(ylim=(1e-3, 1), show_ber=False, show_bler=True)
+plt.show()

@@ -1276,9 +1276,10 @@ class LDPC5GDecoder(LDPCBPDecoder):
         Subsequent transmissions may use a different rv, modulation order
         and/or codeword length than first transmission. The interleaving
         implementation needs to be adapted.
-        The HARQ circular buffer is managed externally by the caller (this
-        simplifies graph mode and allows for reusing the instance with
-        different batches and retransmissions).
+        The HARQ circular buffer is allocated in the first HARQ round, but
+        stored externally by the caller. This simplifies graph mode
+        and allows for reusing the instance with different batches and
+        retransmissions.
         
     Input
     -----
@@ -1487,6 +1488,20 @@ class LDPC5GDecoder(LDPCBPDecoder):
         if start < 0 or start >= self.encoder.n_cb:
             raise ValueError("start must be in the range [0, n_cb-1].")
         self._circ_buff_start = start
+
+    @staticmethod
+    def get_initial_circ_buff() -> tf.Tensor:
+        """Get the initial circular buffer for HARQ mode. It's an empty
+        tensor of shape [0, 1] that is used to initialize the circular buffer
+        in HARQ mode.
+
+        Returns
+        -------
+        circ_buff: [0, 1], tf.float32
+            Empty tensor to be used as initial circular buffer.
+            The caller must manage the circular buffer in HARQ mode.
+        """
+        return tf.zeros([0, 1], dtype=tf.float32)
 
     def build(self, input_shape, **kwargs):
         """Build block"""
