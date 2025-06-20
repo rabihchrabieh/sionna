@@ -1570,7 +1570,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
                 return tf.identity(new_buff), new_buff
 
             # choose init or accumulate based on whether the buffer is
-            # already initialized
+            # already initialized. TODO: consider removing the condition
+            # and initialize the buffer to zeros in the first call.
             llr_5g, circ_buff = tf.cond(
                 tf.equal(tf.shape(circ_buff)[0], 0),
                 true_fn=init_circ_buffer,
