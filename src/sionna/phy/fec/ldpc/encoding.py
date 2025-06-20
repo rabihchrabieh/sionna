@@ -283,7 +283,7 @@ class LDPC5GEncoder(Block):
 
     def set_n(self, n: int):
         """Set the desired codeword length. It can be used to change the
-        codeword length for various retransmissions.
+        codeword length for various retransmissions (rate matching).
 
         Parameters
         ----------
