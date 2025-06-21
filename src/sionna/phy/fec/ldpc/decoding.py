@@ -1535,13 +1535,19 @@ class LDPC5GDecoder(LDPCBPDecoder):
                                         self._encoder.out_int_inv,
                                         axis=-1)
 
-        # undo puncturing and place the LLRs at the right position
-        n = tf.shape(llr_ch_reshaped)[1]
+        # undo puncturing and place the LLRs at the correct position
 
-        # pad to length n_cb = n_ldpc - k_filler
-        pad_len = tf.maximum(0, self.encoder.n_cb - n)
-        llr_5g_unrotated = tf.pad(llr_ch_reshaped,
-                                  [[0, 0], [0, pad_len]])  # shape: [batch, n_cb]
+        # pad to length n_cb = n_ldpc - k_filler. Issue when n may vary,
+        # e.g., during a retransmission in HARQ mode. XLA does not support
+        # dynamic shapes, so we disable jit compilation for the padding function.
+        @tf.function(jit_compile=False)
+        def pad_llr_ch(llr_ch_reshaped, n_cb):
+            n = tf.shape(llr_ch_reshaped)[1]
+            pad_len = tf.maximum(0, n_cb - n)
+            # pad to shape [batch_size, n_cb]
+            return tf.pad(llr_ch_reshaped, [[0, 0], [0, pad_len]])
+
+        llr_5g_unrotated = pad_llr_ch(llr_ch_reshaped, self.encoder.n_cb)
 
         # roll (circular shift)
         llr_5g = tf.roll(llr_5g_unrotated,
@@ -1625,6 +1631,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
         else: # return all codeword bits
             # The transmitted CW bits are not the same as used during decoding
             # cf. last parts of 5G encoding function
+            
+            # Behavior may be undefined when incremental redundancy is used
 
             # remove last dim
             x = tf.reshape(x_hat, [batch_size, self._n_pruned])
@@ -1639,9 +1647,10 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
             x_no_filler = tf.concat([x_no_filler1, x_no_filler2], 1)
 
-            # shorten the first 2*Z positions and end after n bits
+            # shorten the first 2*Z positions (or circ_buff_start) and end
+            # after n bits
             x_short = tf.slice(x_no_filler,
-                               [0, 2*self.encoder.z],
+                               [0, self._circ_buff_start],
                                [batch_size, self.encoder.n])
 
             # if used, apply rate-matching output interleaver again as
