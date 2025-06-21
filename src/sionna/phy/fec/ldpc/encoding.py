@@ -788,21 +788,16 @@ class LDPC5GEncoder(Block):
 
         c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
-        # Rate matching based on circ_buff_start and n
-        # (circ_buff_start = 0 and n = n_cb returns the full buffer
-        # without rate matching)
+        # rate matching based on circ_buff_start and n, with possible wrap
+
+        # to support graph mode, we use modulo approach to handle wrap and
+        # no wrap cases. For some reason, tf.cond and slicing is not working
+        # properly in graph mode (to be revisited).
         start = self._circ_buff_start
-        buffer_end = c_no_filler.shape[1]
-        c_short = tf.cond(
-            tf.convert_to_tensor(start) + self.n <=
-                tf.convert_to_tensor(buffer_end),
-            lambda: c_no_filler[:, start : start + self.n],
-            lambda: tf.concat([
-                c_no_filler[:, start:],
-                c_no_filler[:, : start + self.n - buffer_end]
-            ], axis=1)
-        )
-        
+        indices = tf.range(self.n, dtype=tf.int32)
+        wrapped_indices = tf.math.mod(indices + start, self.n_cb)
+        c_short = tf.gather(c_no_filler, wrapped_indices, axis=1)
+
         # if num_bits_per_symbol is provided, apply output interleaver as
         # specified in Sec. 5.4.2.2 in 38.212
         if self._num_bits_per_symbol is not None:
