@@ -83,3 +83,8 @@ class TestMIMOFlatFading(unittest.TestCase):
                         max_mc_iter=10)
         self.assertFalse(np.isnan(ber).any())
         self.assertFalse(np.isnan(bler).any())
+
+if __name__ == "__main__":
+    tester = TestMIMOFlatFading()
+    tester.test_correlated()
+    
