@@ -1355,10 +1355,6 @@ class LDPC5GDecoder(LDPCBPDecoder):
         self._circ_buff_start = 2 * self.encoder.z  # Default RV0 position
         self._circ_buff = None  # Managed internally by the class
         
-        # Use setters for consistent tensor conversion
-        self.harq_weight_old = 1.0
-        self.harq_weight_new = 1.0
-        
         if self._harq_mode:
             # Not yet implemented for HARQ mode
             prune_pcm = False
@@ -1446,6 +1442,11 @@ class LDPC5GDecoder(LDPCBPDecoder):
                          return_state=return_state,
                          precision=precision,
                          **kwargs)
+
+        # initialize HARQ weights after super().__init__() ensures
+        # rdtype available
+        self.harq_weight_old = 1.0
+        self.harq_weight_new = 1.0
 
     ###############################
     # Public methods and properties

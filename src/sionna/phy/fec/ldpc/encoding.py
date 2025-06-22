@@ -789,28 +789,28 @@ class LDPC5GEncoder(Block):
 
         # rate matching based on circ_buff_start and n, with possible wrap
 
-        # In graph mode safety, if _circ_buff_start and _n change, a
+        # in graph mode safety, if _circ_buff_start and _n change, a
         # new instance of the encoder must be created.
         start = self._circ_buff_start
         n_cb = self.n_cb
         
-        # Check if circular wrap occurs
+        # check if circular wrap occurs
         if start + self.n <= n_cb:
-            # No wrap: simple slice from start to start+n
+            # no wrap: simple slice from start to start+n
             c_short = tf.slice(c_no_filler, [0, start], [batch_size, self.n])
         else:
-            # Wrap occurs: concatenate two slices
-            # First part: from start to end of buffer
+            # wrap occurs: concatenate two slices
+            # first part: from start to end of buffer
             first_part_size = n_cb - start
             first_part = tf.slice(c_no_filler, [0, start], 
                                 [batch_size, first_part_size])
             
-            # Second part: from beginning of buffer
+            # second part: from beginning of buffer
             second_part_size = self.n - first_part_size
             second_part = tf.slice(c_no_filler, [0, 0], 
                                  [batch_size, second_part_size])
             
-            # Concatenate the two parts
+            # concatenate the two parts
             c_short = tf.concat([first_part, second_part], axis=1)
 
         # if num_bits_per_symbol is provided, apply output interleaver as
