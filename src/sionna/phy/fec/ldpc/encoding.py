@@ -730,24 +730,23 @@ class LDPC5GEncoder(Block):
         if input_shape[-1]!=self._k:
             raise ValueError("Last dimension must be of length k.")
 
-    def call(self, bits, rv: Optional[str]=None):
+    def call(self, bits):
         """5G LDPC encoding function including rate-matching.
 
-        This function returns the encoded codewords as specified by the 3GPP NR Initiative [3GPPTS38212_LDPC]_ including puncturing and shortening.
+        This function returns the encoded codewords as specified by the 3GPP NR 
+        Initiative [3GPPTS38212_LDPC]_ including puncturing and shortening.
+        
+        All configuration (RV, codeword length) is set via attributes:
+        - Eager mode: encoder.set_rv('rv1'), encoder.set_n(1000)
+        - Graph mode: Use separate instances for different configurations
 
         Args:
-
         bits (tf.float): Tensor of shape `[...,k]` containing the
                 information bits to be encoded.
-        rv (str): Optional redundancy version to be set. One of 'rv0', 'rv1',
-                  'rv2', 'rv3'. If not supplied, the current RV is used.
 
         Returns:
-
         `tf.float`: Tensor of shape `[...,n]`.
         """
-        if rv is not None:
-            self.set_rv(rv)
 
         # Reshape inputs to [...,k]
         input_shape = bits.get_shape().as_list()
@@ -790,13 +789,29 @@ class LDPC5GEncoder(Block):
 
         # rate matching based on circ_buff_start and n, with possible wrap
 
-        # to support graph mode, we use modulo approach to handle wrap and
-        # no wrap cases. For some reason, tf.cond and slicing is not working
-        # properly in graph mode (to be revisited).
+        # In graph mode safety, if _circ_buff_start and _n change, a
+        # new instance of the encoder must be created.
         start = self._circ_buff_start
-        indices = tf.range(self.n, dtype=tf.int32)
-        wrapped_indices = tf.math.mod(indices + start, self.n_cb)
-        c_short = tf.gather(c_no_filler, wrapped_indices, axis=1)
+        n_cb = self.n_cb
+        
+        # Check if circular wrap occurs
+        if start + self.n <= n_cb:
+            # No wrap: simple slice from start to start+n
+            c_short = tf.slice(c_no_filler, [0, start], [batch_size, self.n])
+        else:
+            # Wrap occurs: concatenate two slices
+            # First part: from start to end of buffer
+            first_part_size = n_cb - start
+            first_part = tf.slice(c_no_filler, [0, start], 
+                                [batch_size, first_part_size])
+            
+            # Second part: from beginning of buffer
+            second_part_size = self.n - first_part_size
+            second_part = tf.slice(c_no_filler, [0, 0], 
+                                 [batch_size, second_part_size])
+            
+            # Concatenate the two parts
+            c_short = tf.concat([first_part, second_part], axis=1)
 
         # if num_bits_per_symbol is provided, apply output interleaver as
         # specified in Sec. 5.4.2.2 in 38.212
