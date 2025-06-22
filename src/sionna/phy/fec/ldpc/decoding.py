@@ -1351,7 +1351,6 @@ class LDPC5GDecoder(LDPCBPDecoder):
         pcm = encoder.pcm
 
         self._harq_mode = harq_mode
-        self._current_rv = 'rv0'  # Default RV for eager mode
         self._circ_buff_start = 2 * self.encoder.z  # Default RV0 position
         self._circ_buff = None  # Managed internally by the class
         
@@ -1516,7 +1515,6 @@ class LDPC5GDecoder(LDPCBPDecoder):
         if rv not in ['rv0', 'rv1', 'rv2', 'rv3']:
             raise ValueError("rv must be one of 'rv0', 'rv1', 'rv2', 'rv3'.")
             
-        self._current_rv = rv
         self._circ_buff_start = LDPC5GEncoder.convert_rv(
             rv, self.encoder.n_cb, self.encoder.z)
         
@@ -1613,15 +1611,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
             if self._circ_buff is None:
                 raise RuntimeError(
                     "HARQ mode requires circular buffer to be initialized. "
-                    "Cf. method init_circ_buff(batch_size).")
-            
-            # Validate buffer batch size matches input
-            buffer_batch_size = tf.shape(self._circ_buff)[0]
-            if not tf.reduce_all(tf.equal(buffer_batch_size, batch_size)):
-                raise RuntimeError(
-                    f"Circular buffer batch size mismatch. "
-                    f"Buffer has batch_size={buffer_batch_size}, "
-                    f"but input has batch_size={batch_size}.")
+                    "Call decoder.init_circ_buff(batch_size) before decoding.")
             
             # Accumulate weighted LLRs
             self._circ_buff = (self._harq_weight_old * self._circ_buff +
@@ -1667,9 +1657,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
             output_shape[0] = -1
             u_reshaped = tf.reshape(u_hat, output_shape)
 
-            if self._harq_mode:
-                return u_reshaped, self._circ_buff, msg_v2c
-            elif self._return_state:
+            if self._return_state:
                 return u_reshaped, msg_v2c
             else:
                 return u_reshaped
@@ -1709,9 +1697,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
             llr_ch_shape[0] = -1
             x_short= tf.reshape(x_short, llr_ch_shape)
 
-            if self._harq_mode:
-                return x_short, self._circ_buff, msg_v2c
-            elif self._return_state:
+            if self._return_state:
                 return x_short, msg_v2c
             else:
                 return x_short
