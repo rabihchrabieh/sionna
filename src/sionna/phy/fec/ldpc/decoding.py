@@ -1572,10 +1572,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         - Eager mode: decoder.set_rv('rv1'), decoder.harq_weight_old = 0.8
         - Graph mode: Use separate instances for different configurations
         """
-
-        # Use current attribute-based configuration
-        start_pos = self._circ_buff_start
-
+        
         llr_ch_shape = llr_ch.get_shape().as_list()
         if not self._harq_mode:
             new_shape = [-1, self.encoder.n]
@@ -1592,9 +1589,13 @@ class LDPC5GDecoder(LDPCBPDecoder):
                                         self._encoder.out_int_inv,
                                         axis=-1)
 
-        # undo puncturing and place the LLRs at the correct position
-
+        # undo puncturing and place the LLRs at the correct position.
+        # we use tf.roll, which hopefully fuses with tf.pad.
+        # graph mode appears to be working but beware that some parameters
+        # do changes such as circular buffer start position.
+        
         # pad to length n_cb = n_ldpc - k_filler.
+        start_pos = self._circ_buff_start
         n = tf.shape(llr_ch_reshaped)[1]
         n_cb = self.encoder.n_cb
         llr_5g_unrotated = tf.pad(llr_ch_reshaped, [[0, 0], [0, n_cb - n]])
