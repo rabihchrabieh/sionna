@@ -10,6 +10,7 @@ from importlib_resources import files, as_file
 from . import codes # pylint: disable=relative-beyond-top-level
 import numbers # to check if n, k are numbers
 from sionna.phy import Block
+from typing import Optional
 
 class LDPC5GEncoder(Block):
     # pylint: disable=line-too-long
@@ -39,6 +40,12 @@ class LDPC5GEncoder(Block):
         Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
 
+    params_only: bool, default=False
+        If set to `True`, the encoder will only initialize the parameters
+        needed for the encoding, but will not load the basegraph or perform
+        any further initialization. This is useful to obtain the parameters
+        of the encoder without loading the full model.
+
     Input
     -----
     bits: [...,k], tf.float
@@ -56,6 +63,9 @@ class LDPC5GEncoder(Block):
     rate-matching (puncturing and shortening). Thus, the corresponding
     decoder needs to `invert` these operations, i.e., must be compatible with
     the 5G encoding scheme.
+
+    The default RV0 is assumed. But before each transmission, the RV can be
+    set as needed.
     """
 
     def __init__(self,
@@ -64,6 +74,7 @@ class LDPC5GEncoder(Block):
                  num_bits_per_symbol=None,
                  bg=None,
                  precision=None,
+                 params_only=False,
                  **kwargs):
 
         super().__init__(precision=precision, **kwargs)
@@ -80,7 +91,7 @@ class LDPC5GEncoder(Block):
         if k<12:
             raise ValueError("Unsupported code length (k too small).")
 
-        if n>(316*384):
+        if n>(68*384) or (bg=="bg2" and n>(52*384)):
             raise ValueError("Unsupported code length (n too large).")
         if n<0:
             raise ValueError("Unsupported code length (n negative).")
@@ -106,12 +117,28 @@ class LDPC5GEncoder(Block):
         self._bg = self._sel_basegraph(self._k, self._coderate, bg)
 
         self._z, self._i_ls, self._k_b = self._sel_lifting(self._k, self._bg)
-        self._bm = self._load_basegraph(self._i_ls, self._bg)
+
+        if not params_only:
+            self._bm = self._load_basegraph(self._i_ls, self._bg)
+            bm_num_cols = self._bm.shape[1]
+        else:
+            # If params_only is True, we do not load the basegraph,
+            # but we still need to set bm_num_cols for the n_ldpc calculation.
+            bm_num_cols = 68 if bg == "bg1" else 52
 
         # total number of codeword bits
         self._n_ldpc = self._bm.shape[1] * self._z
         # if K_real < K _target puncturing must be applied earlier
         self._k_ldpc = self._k_b * self._z
+
+        # specifies where rate matching starts in circular buffer:
+        # default RV0 is assumed
+        self._circ_buff_start = 2 * self._z
+
+        if params_only:
+            # If params_only is True, we only initialize the parameters
+            # and do not load the basegraph or construct the parity-check matrix.
+            return
 
         # construct explicit graph via lifting
         pcm = self._lift_basegraph(self._bm, self._z)
@@ -156,14 +183,26 @@ class LDPC5GEncoder(Block):
         return self._coderate
 
     @property
+    def k_filler(self):
+        """Number of (systematic) filler bits added to the input bits (and
+        removed before rate-matching)"""
+        return self._k_ldpc - self._k
+
+    @property
     def k_ldpc(self):
-        """Number of LDPC information bits after rate-matching"""
+        """Number of LDPC information bits including filler bits"""
         return self._k_ldpc
 
     @property
+    def n_cb(self):
+        """Circular buffer length for HARQ (excludes filler bits)."""
+        return self._n_ldpc - self.k_filler
+
+    @property
     def n_ldpc(self):
-        """Number of LDPC codeword bits before rate-matching"""
-        return self._n_ldpc
+        """Number of codeword bits before rate-matching, including
+        filler bits"""
+        return self._n_ldpc    
 
     @property
     def pcm(self):
@@ -192,6 +231,110 @@ class LDPC5GEncoder(Block):
     #################
     # Utility methods
     #################
+
+    @staticmethod
+    def get_params(k: int, n: int, bg: Optional[str]=None) -> "LDPC5GEncoder":
+        """Get the parameters of the LDPC encoder without loading the basegraph
+        and constructing the parity-check matrix.
+
+        Parameters
+        ----------
+        k: int
+            Number of information bits.
+        n: int
+            Number of codeword bits.
+        bg: `None` (default) | "bg1" | "bg2"
+            Basegraph to be used for the code construction.
+            If `None` is provided, the encoder will automatically select
+            the basegraph according to [3GPPTS38212_LDPC]_.
+
+        Returns
+        -------
+        LDPC5GEncoder instance with the specified parameters but without
+        loading the basegraph or constructing the parity-check matrix.
+        """
+        return LDPC5GEncoder(k=k, n=n, bg=bg, params_only=True)
+
+    @staticmethod
+    def convert_rv(rv: str, n_cb: int, z: int) -> int:
+        """Convert the RV to start of circular buffer (redundancy
+        version).
+
+        Parameters
+        ----------
+        rv: str, one of 'rv0', 'rv1', 'rv2', 'rv3'.
+            Redundancy version to be set.
+
+        n_cb: int
+            Length of the HARQ circular buffer.
+
+        z: int
+            Lifting factor of the basegraph.
+
+        Output
+        -------
+        circ_buff_start: int
+            Start position of the circular buffer for rate-matching.
+            The value is in the range [0, n_cb-1] as specified in 38.212.
+        """
+        if rv not in ['rv0', 'rv1', 'rv2', 'rv3']:
+            raise TypeError("rv must be one of 'rv0', 'rv1', 'rv2', 'rv3'.")
+        if rv == 'rv0':
+            circ_buff_start = 2 * z
+        elif rv == 'rv1':
+            circ_buff_start = n_cb // 4
+        elif rv == 'rv2':
+            circ_buff_start = n_cb // 2
+        else:  # rv == 'rv3'
+            circ_buff_start = 3 * n_cb // 4
+
+        return circ_buff_start
+
+    def set_n(self, n: int):
+        """Set the desired codeword length. It can be used to change the
+        codeword length for various retransmissions (rate matching).
+
+        Parameters
+        ----------
+        n: int
+            Desired codeword length.
+        """
+        if not isinstance(n, numbers.Number):
+            raise TypeError("n must be a number.")
+        n = int(n)
+        if n <= 0:
+            raise ValueError("n must be a positive integer.")
+        if n > self.n_cb:
+            raise ValueError("n must be smaller than n_cb.")
+        self._n = n
+
+    def set_rv(self, rv: str) -> int:
+        """Set the RV (redundancy version)."""
+        self._circ_buff_start = LDPC5GEncoder.convert_rv(
+            rv, self.n_cb, self.z)
+        return self._circ_buff_start
+
+    def set_circ_buff_start(self, start: int):
+        """Set the circular buffer start position for rate-matching,
+        outside the usual RV setting.
+
+        Parameters
+        ----------
+        start: int
+            Start position of the circular buffer. The value must be in the
+            range [0, n_cb-1] as specified in 38.212.
+        """
+        if not isinstance(start, numbers.Number):
+            raise TypeError("start must be a number.")
+        if start < 0 or start >= self.n_cb:
+            raise ValueError("start must be in the range [0, n_cb-1].")
+        self._circ_buff_start = start
+
+    def set_full_circ_buffer(self):
+        """Set the circular buffer start position to 0 and n to n_cb,
+        i.e., return the full buffer without rate-matching."""
+        self._circ_buff_start = 0
+        self._n = self.n_cb
 
     def generate_out_int(self, n, num_bits_per_symbol):
         """Generates LDPC output interleaver sequence as defined in
@@ -650,10 +793,28 @@ class LDPC5GEncoder(Block):
 
         c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
-        # shorten the first 2*Z positions and end after n bits
-        # (remaining parity bits can be used for HARQ)
-        c_short = tf.slice(c_no_filler, [0, 2*self._z], [batch_size, self.n])
-        # incremental redundancy could be generated by accessing the last bits
+        # rate matching based on circ_buff_start and n, with possible wrap
+        start = self._circ_buff_start
+        n_cb = self.n_cb
+
+        # check if circular wrap occurs
+        if start + self.n <= n_cb:
+            # no wrap: simple slice from start to start+n
+            c_short = tf.slice(c_no_filler, [0, start], [batch_size, self.n])
+        else:
+            # wrap occurs: concatenate two slices
+            # first part: from start to end of buffer
+            first_part_size = n_cb - start
+            first_part = tf.slice(c_no_filler, [0, start], 
+                                [batch_size, first_part_size])
+
+            # second part: from beginning of buffer
+            second_part_size = self.n - first_part_size
+            second_part = tf.slice(c_no_filler, [0, 0], 
+                                 [batch_size, second_part_size])
+
+            # concatenate the two parts
+            c_short = tf.concat([first_part, second_part], axis=1)
 
         # if num_bits_per_symbol is provided, apply output interleaver as
         # specified in Sec. 5.4.2.2 in 38.212
