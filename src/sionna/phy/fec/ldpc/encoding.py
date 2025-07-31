@@ -131,10 +131,6 @@ class LDPC5GEncoder(Block):
         # if K_real < K _target puncturing must be applied earlier
         self._k_ldpc = self._k_b * self._z
 
-        # specifies where rate matching starts in circular buffer:
-        # default RV0 is assumed
-        self._circ_buff_start = 2 * self._z
-
         if params_only:
             # If params_only is True, we only initialize the parameters
             # and do not load the basegraph or construct the parity-check matrix.
@@ -254,87 +250,6 @@ class LDPC5GEncoder(Block):
         loading the basegraph or constructing the parity-check matrix.
         """
         return LDPC5GEncoder(k=k, n=n, bg=bg, params_only=True)
-
-    @staticmethod
-    def convert_rv(rv: str, n_cb: int, z: int) -> int:
-        """Convert the RV to start of circular buffer (redundancy
-        version).
-
-        Parameters
-        ----------
-        rv: str, one of 'rv0', 'rv1', 'rv2', 'rv3'.
-            Redundancy version to be set.
-
-        n_cb: int
-            Length of the HARQ circular buffer.
-
-        z: int
-            Lifting factor of the basegraph.
-
-        Output
-        -------
-        circ_buff_start: int
-            Start position of the circular buffer for rate-matching.
-            The value is in the range [0, n_cb-1] as specified in 38.212.
-        """
-        if rv not in ['rv0', 'rv1', 'rv2', 'rv3']:
-            raise TypeError("rv must be one of 'rv0', 'rv1', 'rv2', 'rv3'.")
-        if rv == 'rv0':
-            circ_buff_start = 2 * z
-        elif rv == 'rv1':
-            circ_buff_start = n_cb // 4
-        elif rv == 'rv2':
-            circ_buff_start = n_cb // 2
-        else:  # rv == 'rv3'
-            circ_buff_start = 3 * n_cb // 4
-
-        return circ_buff_start
-
-    def set_n(self, n: int):
-        """Set the desired codeword length. It can be used to change the
-        codeword length for various retransmissions (rate matching).
-
-        Parameters
-        ----------
-        n: int
-            Desired codeword length.
-        """
-        if not isinstance(n, numbers.Number):
-            raise TypeError("n must be a number.")
-        n = int(n)
-        if n <= 0:
-            raise ValueError("n must be a positive integer.")
-        if n > self.n_cb:
-            raise ValueError("n must be smaller than n_cb.")
-        self._n = n
-
-    def set_rv(self, rv: str) -> int:
-        """Set the RV (redundancy version)."""
-        self._circ_buff_start = LDPC5GEncoder.convert_rv(
-            rv, self.n_cb, self.z)
-        return self._circ_buff_start
-
-    def set_circ_buff_start(self, start: int):
-        """Set the circular buffer start position for rate-matching,
-        outside the usual RV setting.
-
-        Parameters
-        ----------
-        start: int
-            Start position of the circular buffer. The value must be in the
-            range [0, n_cb-1] as specified in 38.212.
-        """
-        if not isinstance(start, numbers.Number):
-            raise TypeError("start must be a number.")
-        if start < 0 or start >= self.n_cb:
-            raise ValueError("start must be in the range [0, n_cb-1].")
-        self._circ_buff_start = start
-
-    def set_full_circ_buffer(self):
-        """Set the circular buffer start position to 0 and n to n_cb,
-        i.e., return the full buffer without rate-matching."""
-        self._circ_buff_start = 0
-        self._n = self.n_cb
 
     def generate_out_int(self, n, num_bits_per_symbol):
         """Generates LDPC output interleaver sequence as defined in
@@ -712,6 +627,20 @@ class LDPC5GEncoder(Block):
 
         return retval
 
+    def _get_rv_starts(self) -> dict:
+        """Get RV starting positions mapping as per 3GPP TS 38.212.
+        
+        Returns
+        -------
+        dict: Mapping from RV names to starting positions.
+        """
+        return {
+            "rv0": 2 * self.z,
+            "rv1": self.n_cb // 4,
+            "rv2": self.n_cb // 2, 
+            "rv3": 3 * self.n_cb // 4
+        }
+
     def _encode_fast(self, s):
         """Main encoding function based on gathering function."""
         p_a = self._matmul_gather(self._pcm_a_ind, s)
@@ -739,7 +668,7 @@ class LDPC5GEncoder(Block):
         if input_shape[-1]!=self._k:
             raise ValueError("Last dimension must be of length k.")
 
-    def call(self, bits):
+    def call(self, bits, rv=None):
         """5G LDPC encoding function including rate-matching.
 
         This function returns the encoded codewords as specified by the 3GPP NR Initiative [3GPPTS38212_LDPC]_ including puncturing and shortening.
@@ -748,11 +677,22 @@ class LDPC5GEncoder(Block):
 
         bits (tf.float): Tensor of shape `[...,k]` containing the
                 information bits to be encoded.
+        rv (list, optional): List of redundancy version strings to generate. Can contain
+                any combination of ["rv0", "rv1", "rv2", "rv3"] in any order,
+                including repeats. If None, defaults to single RV0 encoding without
+                adding an RV dimension to the output.
 
         Returns:
 
-        `tf.float`: Tensor of shape `[...,n]`.
+        `tf.float`: Tensor of shape `[..., n]` if rv is None (single RV0), or 
+                    `[..., num_rv, n]` if rv is provided, where num_rv is the 
+                    length of the rv list.
         """
+        
+        # Determine HARQ mode and set RV list
+        harq_mode = rv is not None
+        if not harq_mode:
+            rv = ["rv0"]
 
         # Reshape inputs to [...,k]
         input_shape = bits.get_shape().as_list()
@@ -793,37 +733,53 @@ class LDPC5GEncoder(Block):
 
         c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
-        # rate matching based on circ_buff_start and n, with possible wrap
-        start = self._circ_buff_start
+        # Generate rate-matched outputs for each RV
+        c_short_list = []
         n_cb = self.n_cb
 
-        # check if circular wrap occurs
-        if start + self.n <= n_cb:
-            # no wrap: simple slice from start to start+n
-            c_short = tf.slice(c_no_filler, [0, start], [batch_size, self.n])
-        else:
-            # wrap occurs: concatenate two slices
-            # first part: from start to end of buffer
-            first_part_size = n_cb - start
-            first_part = tf.slice(c_no_filler, [0, start], 
-                                [batch_size, first_part_size])
+        # Get RV starting positions mapping
+        rv_starts = self._get_rv_starts()
 
-            # second part: from beginning of buffer
-            second_part_size = self.n - first_part_size
-            second_part = tf.slice(c_no_filler, [0, 0], 
-                                 [batch_size, second_part_size])
+        for rv_name in rv:
+            start = rv_starts[rv_name]
 
-            # concatenate the two parts
-            c_short = tf.concat([first_part, second_part], axis=1)
+            # check if circular wrap occurs
+            if start + self.n <= n_cb:
+                # no wrap: simple slice from start to start+n
+                c_short_rv = tf.slice(c_no_filler, [0, start], [batch_size, self.n])
+            else:
+                # wrap occurs: concatenate two slices
+                # first part: from start to end of buffer
+                first_part_size = n_cb - start
+                first_part = tf.slice(c_no_filler, [0, start], 
+                                    [batch_size, first_part_size])
 
-        # if num_bits_per_symbol is provided, apply output interleaver as
-        # specified in Sec. 5.4.2.2 in 38.212
-        if self._num_bits_per_symbol is not None:
-            c_short = tf.gather(c_short, self._out_int, axis=-1)
+                # second part: from beginning of buffer
+                second_part_size = self.n - first_part_size
+                second_part = tf.slice(c_no_filler, [0, 0], 
+                                     [batch_size, second_part_size])
 
-        # Reshape c_short so that it matches the original input dimensions
-        output_shape = input_shape[0:-1] + [self.n]
-        output_shape[0] = -1
+                # concatenate the two parts
+                c_short_rv = tf.concat([first_part, second_part], axis=-1)
+
+            # if num_bits_per_symbol is provided, apply output interleaver as
+            # specified in Sec. 5.4.2.2 in 38.212
+            if self._num_bits_per_symbol is not None:
+                c_short_rv = tf.gather(c_short_rv, self._out_int, axis=-1)
+
+            # Reshape to [batch_size, 1, n] for proper stacking
+            c_short_rv = tf.expand_dims(c_short_rv, axis=1)
+            c_short_list.append(c_short_rv)
+
+        # Stack all RV versions: [batch_size, num_rv, n]
+        c_short = tf.concat(c_short_list, axis=1)
+
+        # Reshape to match original input dimensions
+        output_shape = input_shape[0:-1] + [len(rv), self.n]
         c_reshaped = tf.reshape(c_short, output_shape)
+
+        # Remove RV dimension if not in HARQ mode
+        if not harq_mode:
+            c_reshaped = tf.squeeze(c_reshaped, axis=-2)  # Remove the RV dimension
 
         return c_reshaped
