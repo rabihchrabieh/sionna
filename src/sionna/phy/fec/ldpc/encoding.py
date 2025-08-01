@@ -627,20 +627,6 @@ class LDPC5GEncoder(Block):
 
         return retval
 
-    def _get_rv_starts(self) -> dict:
-        """Get RV starting positions mapping as per 3GPP TS 38.212.
-        
-        Returns
-        -------
-        dict: Mapping from RV names to starting positions.
-        """
-        return {
-            "rv0": 2 * self.z,
-            "rv1": self.n_cb // 4,
-            "rv2": self.n_cb // 2, 
-            "rv3": 3 * self.n_cb // 4
-        }
-
     def _encode_fast(self, s):
         """Main encoding function based on gathering function."""
         p_a = self._matmul_gather(self._pcm_a_ind, s)
@@ -662,7 +648,21 @@ class LDPC5GEncoder(Block):
         c = tf.expand_dims(c, axis=-1) # returns nx1 vector
         return c
 
-    def build(self, input_shape):
+    def get_rv_starts(self) -> dict:
+        """Get RV starting positions mapping as per 3GPP TS 38.212.
+        
+        Returns
+        -------
+        dict: Mapping from RV names to starting positions.
+        """
+        return {
+            "rv0": 2 * self.z,
+            "rv1": self.n_cb // 4,
+            "rv2": self.n_cb // 2, 
+            "rv3": 3 * self.n_cb // 4
+        }
+
+    def build(self, input_shape, **kwargs):
         """"Build block."""
         # check if k and input shape match
         if input_shape[-1]!=self._k:
@@ -688,7 +688,7 @@ class LDPC5GEncoder(Block):
                     `[..., num_rv, n]` if rv is provided, where num_rv is the 
                     length of the rv list.
         """
-        
+
         # Determine HARQ mode and set RV list
         harq_mode = rv is not None
         if not harq_mode:
@@ -733,13 +733,11 @@ class LDPC5GEncoder(Block):
 
         c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
-        # Generate rate-matched outputs for each RV
+        # get RV starting positions mapping
+        rv_starts = self.get_rv_starts()
+
         c_short_list = []
         n_cb = self.n_cb
-
-        # Get RV starting positions mapping
-        rv_starts = self._get_rv_starts()
-
         for rv_name in rv:
             start = rv_starts[rv_name]
 
@@ -771,14 +769,15 @@ class LDPC5GEncoder(Block):
             c_short_rv = tf.expand_dims(c_short_rv, axis=1)
             c_short_list.append(c_short_rv)
 
-        # Stack all RV versions: [batch_size, num_rv, n]
+        # stack all RV versions: [batch_size, num_rv, n]
         c_short = tf.concat(c_short_list, axis=1)
 
-        # Reshape to match original input dimensions
+        # reshape to match original input dimensions
         output_shape = input_shape[0:-1] + [len(rv), self.n]
+        output_shape[0] = -1  # It can be None
         c_reshaped = tf.reshape(c_short, output_shape)
 
-        # Remove RV dimension if not in HARQ mode
+        # remove RV dimension if not in HARQ mode
         if not harq_mode:
             c_reshaped = tf.squeeze(c_reshaped, axis=-2)  # Remove the RV dimension
 
