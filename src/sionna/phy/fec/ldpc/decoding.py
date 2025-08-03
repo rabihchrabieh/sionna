@@ -1274,6 +1274,15 @@ class LDPC5GDecoder(LDPCBPDecoder):
         In graph mode, there are various options including creating different
         class instances for different cases.
 
+    accumulator: `None` (default) | callable
+        Function to accumulate LLRs from multiple transmissions. If `None`, uses 
+        simple addition. The callable should have signature:
+        `accumulator(llr_accumulated, llr_new, transmission_idx)`
+        where `llr_accumulated` is the current accumulated LLRs (or None for first 
+        transmission), `llr_new` is the new LLRs to accumulate, and 
+        `transmission_idx` is the transmission index (0, 1, 2, ...).
+        Should return the updated accumulated LLRs.
+
     Input
     -----
     llr_ch: [...,n] or [...,num_rv,n], tf.float
@@ -1342,6 +1351,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
                  return_state=False,
                  precision=None,
                  harq_mode=False,
+                 accumulator=None,
                  **kwargs):
 
         # needs the 5G Encoder to access all 5G parameters
@@ -1422,6 +1432,14 @@ class LDPC5GDecoder(LDPCBPDecoder):
                 cn_schedule.append(np.arange(z) + i*z)
             cn_schedule = tf.stack(cn_schedule, axis=0)
 
+        # Set up accumulator function
+        if accumulator is None:
+            self._accumulator = self._default_accumulator
+        elif callable(accumulator):
+            self._accumulator = accumulator
+        else:
+            raise TypeError("accumulator must be callable or None")
+
         super().__init__(pcm,
                          cn_update=cn_update,
                          vn_update=vn_update,
@@ -1434,6 +1452,106 @@ class LDPC5GDecoder(LDPCBPDecoder):
                          return_state=return_state,
                          precision=precision,
                          **kwargs)
+
+    def _default_accumulator(self, llr_accumulated, llr_new, transmission_idx):
+        """Default LLR accumulator: simple addition.
+        
+        Args:
+            llr_accumulated: Previous accumulated LLRs or None for first transmission
+            llr_new: New LLRs to accumulate
+            transmission_idx: Index of current transmission (0, 1, 2, ...)
+            
+        Returns:
+            Updated accumulated LLRs
+        """
+        if llr_accumulated is None:
+            return llr_new
+        else:
+            return llr_accumulated + llr_new
+
+def quantized_accumulator(num_bits=6, scaling_method='max'):
+    """Factory function for quantized LLR accumulation with level preservation.
+    
+    This function creates an accumulator that performs normal floating-point 
+    accumulation and then quantizes only the final result to the specified number 
+    of bits while preserving the overall signal level.
+    
+    Args:
+        num_bits: Number of quantization bits (default: 6)
+            Valid range: 3-8 bits. Higher values provide better precision.
+        scaling_method: Method for level-preserving quantization (default: 'max')
+            - 'max': Scale based on maximum absolute value
+            - 'rms': Scale based on RMS (root mean square) value  
+            - 'std': Scale based on standard deviation
+            - 'percentile': Scale based on 95th percentile
+            
+    Returns:
+        Accumulator function with configured quantization
+        
+    Example:
+        # 6-bit quantization with max scaling
+        acc = quantized_accumulator(num_bits=6, scaling_method='max')
+        decoder = LDPC5GDecoder(..., accumulator=acc)
+        
+        # 8-bit quantization with RMS scaling
+        acc = quantized_accumulator(num_bits=8, scaling_method='rms')
+        decoder = LDPC5GDecoder(..., accumulator=acc)
+    """
+    import tensorflow as tf
+    
+    def _quantize_level_preserving(llr, num_bits, scaling_method):
+        """Quantize LLRs while preserving signal level."""
+        if llr is None:
+            return None
+
+        # Calculate quantization levels (signed quantization)
+        max_val = 2**(num_bits-1) - 1  # e.g., 31 for 6-bit signed
+        min_val = -2**(num_bits-1)     # e.g., -32 for 6-bit signed
+
+        # Determine scaling factor based on method
+        if scaling_method == 'max':
+            scale_factor = tf.reduce_max(tf.abs(llr)) + 1e-12
+        elif scaling_method == 'rms':
+            scale_factor = tf.sqrt(tf.reduce_mean(tf.square(llr))) + 1e-12
+        elif scaling_method == 'std':
+            scale_factor = tf.math.reduce_std(llr) + 1e-12
+        elif scaling_method == 'percentile':
+            # Use 95th percentile of absolute values
+            abs_llr = tf.abs(llr)
+            # Sort and take 95th percentile
+            sorted_abs = tf.sort(tf.reshape(abs_llr, [-1]))
+            percentile_idx = tf.cast(tf.round(0.95 * tf.cast(tf.size(sorted_abs), tf.float32)), tf.int32)
+            percentile_idx = tf.clip_by_value(percentile_idx, 0, tf.size(sorted_abs) - 1)
+            scale_factor = sorted_abs[percentile_idx] + 1e-12
+        else:
+            raise ValueError(f"Unknown scaling_method: {scaling_method}")
+
+        # Normalize to quantization range
+        llr_normalized = llr / scale_factor * max_val
+
+        # Quantize with clipping
+        llr_quantized = tf.round(tf.clip_by_value(llr_normalized, min_val, max_val))
+
+        # Scale back to preserve original level
+        llr_scaled_back = llr_quantized * scale_factor / max_val
+
+        return llr_scaled_back
+
+    def accumulator(llr_accumulated, llr_new, transmission_idx):
+        """Quantized accumulator with level preservation.
+        
+        Performs normal floating-point accumulation and quantizes only the final result.
+        """
+        
+        if llr_accumulated is None:
+            # First transmission: quantize and return
+            return _quantize_level_preserving(llr_new, num_bits, scaling_method)
+        else:
+            # Subsequent transmissions: accumulate in floating point, then quantize
+            llr_sum = llr_accumulated + llr_new
+            return _quantize_level_preserving(llr_sum, num_bits, scaling_method)
+
+    return accumulator
 
     ###############################
     # Public methods and properties
@@ -1518,11 +1636,8 @@ class LDPC5GDecoder(LDPCBPDecoder):
             # apply circular shift to reconstruct original position
             llr_rv_unrolled = tf.roll(llr_rv_padded, shift=start_pos[rv_idx], axis=1)
 
-            # accumulate
-            if llr_accumulated is None:
-                llr_accumulated = llr_rv_unrolled
-            else:
-                llr_accumulated += llr_rv_unrolled
+            # accumulate using the configured accumulator function
+            llr_accumulated = self._accumulator(llr_accumulated, llr_rv_unrolled, rv_idx)
 
         # use accumulated LLRs for further processing
         llr_5g = llr_accumulated
