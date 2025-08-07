@@ -1486,14 +1486,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
         """Build block"""
 
         # check input dimensions for consistency
-        # Support both [..., n] and [..., num_rv, n] shapes
-        if len(input_shape) >= 2 and input_shape[-1] == self.encoder.n:
-            # Could be [..., n] or [..., num_rv, n] - both are valid
-            pass
-        elif len(input_shape) >= 3 and input_shape[-1] == self.encoder.n:
-            # [..., num_rv, n] format - also valid
-            pass  
-        else:
+        if input_shape[-1]!=self.encoder.n:
             raise ValueError('Last dimension must be of length n.')
 
         self._old_shape_5g = input_shape
