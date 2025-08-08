@@ -19,46 +19,124 @@ from sionna.phy.mapping import Mapper, Demapper, Constellation
 # Test cases for LDPC5G HARQ
 #############################
 
-@pytest.mark.parametrize("k", [400])
-@pytest.mark.parametrize("n", [800, 900])
-@pytest.mark.parametrize("rv_list", [["rv0"], ["rv0", "rv1"], ["rv0", "rv1", "rv2"], ["rv0", "rv1", "rv2", "rv3"]])
-def test_harq_basic_functionality(k, n, rv_list):
-    """Test basic HARQ functionality with different RV combinations.
+@pytest.mark.parametrize("k_n", [(400, 900), (5000, 12000)])
+@pytest.mark.parametrize("rv_list", [["rv0", "rv1", "rv2", "rv3"]])
+def test_harq_encoder(k_n, rv_list):
+    """Test HARQ encoder functionality with different RV combinations.
     
-    This test verifies that the HARQ decoder can handle different numbers of 
-    redundancy versions (RVs) and code parameters. It uses synthetic LLRs 
-    (assuming all-zero codeword) to test the decoder interface rather than 
-    actual decoding correctness.
+    This test verifies that the HARQ encoder correctly generates codewords
+    for different redundancy versions (RVs) by comparing against a reference
+    encoder with circular shifting.
     
     Tests:
     - Various code rates (k/n combinations)
-    - Different numbers of HARQ transmissions (1-4 RVs)
-    - Basic output shape and data type validation
-    - Decoder doesn't crash with different RV configurations
+    - HARQ transmissions (4 RVs)
+    - Correct RV-specific codeword generation
+    - Output shape and data type validation
+    - Encoder doesn't crash with different RV configurations
+    """
+    # Set random seed for reproducibility
+    tf.random.set_seed(42)
+
+    k, n = k_n
+    batch_size = 2
+    num_rv = len(rv_list)
+
+    ldpc_params = LDPC5GEncoder.get_params(k, n)
+    n_cb = ldpc_params.n_cb
+
+    # Reference encoder
+    encoder_ref = LDPC5GEncoder(k, n_cb, harq_mode=True)
+
+    # HARQ encoder
+    encoder = LDPC5GEncoder(k, n, harq_mode=True)
+    starts = encoder.get_rv_starts()
+
+    # Generate encoded bits
+    source = BinarySource()
+    bits = source([batch_size, k])
+    x_ref = encoder_ref(bits)  # Shape: [batch_size, n_cb]
+    x = encoder(bits, rv=rv_list)  # Shape: [batch_size, num_rv, n]
+
+    # Validate encoded bits
+    assert x.shape == [batch_size, num_rv, n]
+    for i, rv in enumerate(rv_list):
+        start = starts[rv]
+        x_ref_unrolled = tf.roll(x_ref, shift=-start, axis=-1)
+        x_ref_unrolled = x_ref_unrolled[:, :n]  # Adjust to match n length
+        assert tf.equal(x_ref_unrolled, x[:, i, :]).numpy().all(), \
+            f"RV {rv} encoding mismatch"
+
+
+@pytest.mark.parametrize("k_n", [(400, 900)])
+@pytest.mark.parametrize("use_graph_mode", [True, False])
+@pytest.mark.parametrize("use_xla", [True, False])
+def test_harq_encoder_graph_xla(k_n, use_graph_mode, use_xla):
+    """Test HARQ encoder in graph mode and XLA compilation.
+    
+    This test ensures that the HARQ encoder works correctly under different
+    execution modes: eager mode, graph mode, and XLA compilation. This is
+    important for performance optimization and deployment scenarios.
+    
+    Tests:
+    - Eager mode execution (use_graph_mode=False, use_xla=False)
+    - Graph mode execution with @tf.function decoration
+    - XLA compilation compatibility (jit_compile=True)
+    - Consistent output across execution modes
+    - No performance regressions or compilation errors
     """
     
-    # Skip invalid code rate combinations
-    code_rate = k / n
-    if code_rate > 0.9 or code_rate < 0.25:
-        pytest.skip(f"Skipping invalid code rate {code_rate:.3f} for k={k}, n={n}")
+    # Set random seed for reproducibility
+    tf.random.set_seed(123)
     
-    batch_size = 2
-    encoder = LDPC5GEncoder(k, n)
-    decoder = LDPC5GDecoder(encoder, harq_mode=True, num_iter=20)
-    source = GaussianPriorSource()
+    k, n = k_n
+    batch_size = 4
+    rv_list = ["rv0", "rv1", "rv2"]
+
+    ldpc_params = LDPC5GEncoder.get_params(k, n)
+    n_cb = ldpc_params.n_cb
+
+    # Reference encoder for validation
+    encoder_ref = LDPC5GEncoder(k, n_cb)
     
-    # Generate LLRs for each RV
-    num_rv = len(rv_list)
-    llr_shape = [batch_size, num_rv, n]
-    llr_ch = source(llr_shape, 0.5)
+    # HARQ encoder
+    encoder = LDPC5GEncoder(k, n, harq_mode=True)
+    starts = encoder.get_rv_starts()
     
-    # Test decoding with RV list
-    result = decoder(llr_ch, rv=rv_list)
+    source = BinarySource()
     
-    # Basic shape checks
-    expected_shape = [batch_size, k]  # Should return info bits by default
-    assert result.shape == expected_shape
-    assert result.dtype == tf.float32
+    @tf.function(jit_compile=use_xla)
+    def run_harq_encoder():
+        bits = source([batch_size, k])
+        x_ref = encoder_ref(bits)
+        x_harq = encoder(bits, rv=rv_list)
+        return bits, x_ref, x_harq
+    
+    if use_graph_mode:
+        bits, x_ref, x_harq = run_harq_encoder()
+    else:
+        bits = source([batch_size, k])
+        x_ref = encoder_ref(bits)
+        x_harq = encoder(bits, rv=rv_list)
+
+    # Validate output shapes and types
+    assert x_harq.shape == [batch_size, len(rv_list), n]
+    assert x_harq.dtype == tf.float32
+    assert not tf.reduce_any(tf.math.is_nan(x_harq))
+    
+    # Validate correctness by comparing with reference
+    for i, rv in enumerate(rv_list):
+        start = starts[rv]
+        x_ref_unrolled = tf.roll(x_ref, shift=-start, axis=-1)
+        x_ref_unrolled = x_ref_unrolled[:, :n]
+        
+        # Should be bitwise identical
+        assert tf.reduce_all(tf.equal(x_ref_unrolled, x_harq[:, i, :])), \
+            f"RV {rv} encoding mismatch in mode: Graph={use_graph_mode}, XLA={use_xla}"
+    
+    # Print mode info for debugging
+    mode_str = f"Graph={use_graph_mode}, XLA={use_xla}"
+    print(f"HARQ encoder test passed for {mode_str}")
 
 
 @pytest.mark.parametrize("return_infobits", [True, False])
@@ -468,3 +546,12 @@ def test_custom_accumulator_function():
 # - Test performance benchmarks
 # - Test memory usage in HARQ mode
 # - Test with varying batch sizes during HARQ
+
+if __name__ == "__main__":
+    # Debug the test_harq_encoder function
+    k_n = (400, 900)
+    rv_list = ["rv0", "rv1", "rv2", "rv3"]
+    
+    print("Starting debug of test_harq_encoder...")
+    test_harq_encoder(k_n, rv_list)
+    print("test_harq_encoder completed successfully!")

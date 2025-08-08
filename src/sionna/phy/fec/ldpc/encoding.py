@@ -40,6 +40,11 @@ class LDPC5GEncoder(Block):
         Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
 
+    harq_mode: bool, default=False
+        If set to `True`, the encoder will operate in HARQ mode. This flag
+        is only used to set k_b per the 3GPP specification, and not
+        perform limit checks on minimum code rate (edge cases).
+
     params_only: bool, default=False
         If set to `True`, the encoder will only initialize the parameters
         needed for the encoding, but will not load the basegraph or perform
@@ -74,6 +79,7 @@ class LDPC5GEncoder(Block):
                  num_bits_per_symbol=None,
                  bg=None,
                  precision=None,
+                 harq_mode=False,
                  params_only=False,
                  **kwargs):
 
@@ -102,13 +108,15 @@ class LDPC5GEncoder(Block):
         self._coderate = k / n
         self._check_input = True # check input for consistency (i.e., binary)
 
+        self._harq_mode = harq_mode # if True, the encoder is used in HARQ mode
+
         # allow actual code rates slightly larger than 948/1024
         # to account for the quantization procedure in 38.214 5.1.3.1
         if self._coderate>(948/1024): # as specified in 38.212 5.4.2.1
             print(f"Warning: effective coderate r>948/1024 for n={n}, k={k}.")
         if self._coderate>(0.95): # as specified in 38.212 5.4.2.1
             raise ValueError(f"Unsupported coderate (r>0.95) for n={n}, k={k}.")
-        if self._coderate<(1/5):
+        if self._coderate<(1/5) and not self._harq_mode:
             # outer rep. coding currently not supported
             raise ValueError("Unsupported coderate (r<1/5).")
 
@@ -127,7 +135,7 @@ class LDPC5GEncoder(Block):
             bm_num_cols = 68 if bg == "bg1" else 52
 
         # total number of codeword bits
-        self._n_ldpc = self._bm.shape[1] * self._z
+        self._n_ldpc = bm_num_cols * self._z
         # if K_real < K _target puncturing must be applied earlier
         self._k_ldpc = self._k_b * self._z
 
@@ -231,7 +239,7 @@ class LDPC5GEncoder(Block):
     @staticmethod
     def get_params(k: int, n: int, bg: Optional[str]=None) -> "LDPC5GEncoder":
         """Get the parameters of the LDPC encoder without loading the basegraph
-        and constructing the parity-check matrix.
+        and constructing the parity-check matrix. Assume HARQ mode is enabled.
 
         Parameters
         ----------
@@ -249,7 +257,7 @@ class LDPC5GEncoder(Block):
         LDPC5GEncoder instance with the specified parameters but without
         loading the basegraph or constructing the parity-check matrix.
         """
-        return LDPC5GEncoder(k=k, n=n, bg=bg, params_only=True)
+        return LDPC5GEncoder(k=k, n=n, bg=bg, harq_mode=True, params_only=True)
 
     def generate_out_int(self, n, num_bits_per_symbol):
         """Generates LDPC output interleaver sequence as defined in
@@ -458,11 +466,12 @@ class LDPC5GEncoder(Block):
                         z = s1
                         i_ls = i
 
-        # and set K=22*Z for bg1 and K=10Z for bg2
-        if bg == "bg1":
-            k_b = 22
-        else:
-            k_b = 10
+        if not self._harq_mode:
+            # and set K=22*Z for bg1 and K=10Z for bg2
+            if bg == "bg1":
+                k_b = 22
+            else:
+                k_b = 10
 
         return z, i_ls, k_b
 
@@ -690,8 +699,8 @@ class LDPC5GEncoder(Block):
         """
 
         # Determine HARQ mode and set RV list
-        harq_mode = rv is not None
-        if not harq_mode:
+        harq_mode = rv is not None or self._harq_mode
+        if rv is None:
             rv = ["rv0"]
 
         # Reshape inputs to [...,k]
