@@ -655,6 +655,22 @@ class LDPC5GEncoder(Block):
         c = tf.expand_dims(c, axis=-1) # returns nx1 vector
         return c
 
+    def validate_rv_list(self, rv_list):
+        """Validate that all RV names in the list are valid.
+        
+        Args:
+            rv_list (list): List of RV name strings to validate.
+            
+        Raises:
+            ValueError: If any RV name is invalid.
+        """
+        valid_rvs = {"rv0", "rv1", "rv2", "rv3"}
+        for rv_name in rv_list:
+            if rv_name not in valid_rvs:
+                raise ValueError(
+                    f"Invalid RV name '{rv_name}'. Valid RV names are: {sorted(valid_rvs)}"
+                )
+
     def get_rv_starts(self) -> dict:
         """Get RV starting positions mapping as per 3GPP TS 38.212.
         
@@ -700,6 +716,9 @@ class LDPC5GEncoder(Block):
         harq_mode = rv is not None
         if rv is None:
             rv = ["rv0"]
+
+        # Validate RV names
+        self.validate_rv_list(rv)
 
         # Reshape inputs to [...,k]
         input_shape = bits.get_shape().as_list()

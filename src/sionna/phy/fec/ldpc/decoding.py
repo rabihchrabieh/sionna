@@ -1468,6 +1468,28 @@ class LDPC5GDecoder(LDPCBPDecoder):
             return llr_new
         else:
             return llr_accumulated + llr_new
+        
+    def _validate_rv_len(self, llr_ch, rv_list):
+        """Validate that tensor RV dimension matches RV list length.
+        
+        Args:
+            llr_ch: Input tensor to validate.
+            rv_list (list): List of RV name strings.
+            
+        Raises:
+            tf.errors.InvalidArgumentError: If tensor RV dimension doesn't match RV list length.
+        """
+        if len(llr_ch.shape) >= 2:
+            tensor_rv_dim = tf.shape(llr_ch)[-2]  # Second-to-last dimension
+            num_rv = len(rv_list)
+            
+            tf.debugging.assert_equal(
+                tensor_rv_dim, 
+                num_rv,
+                message=f"Input tensor RV dimension must match RV list length. "
+                        f"Expected {num_rv}, but tensor has mismatched "
+                        f"second-to-last dimension."
+            )
 
     ###############################
     # Public methods and properties
@@ -1513,6 +1535,9 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
         if rv is None or not self._harq_mode:
             rv = ["rv0"]
+        else:
+            self.encoder.validate_rv_list(rv)
+            self._validate_rv_len(llr_ch, rv)
 
         k = self.encoder.k
         n = tf.shape(llr_ch)[-1]  # or self.encoder.n
